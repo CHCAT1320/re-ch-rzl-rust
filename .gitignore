@@ -1,0 +1,27 @@
+# Rust build output
+/target/
+
+# Local binary tools and generated executables
+/ch-rzl-rust.exe
+/ffmpeg.exe
+/ffplay.exe
+
+# Original web project/reference files
+/ch-rzl/
+
+# Generated renderer outputs
+/render_output.mp4
+/render_mixed_audio.wav
+/target/debug/render_mixed_audio.wav
+/target/release/render_mixed_audio.wav
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Editor/OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

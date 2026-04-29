@@ -1,0 +1,64 @@
+name: Draft Release
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: draft-release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  draft-release:
+    name: Build Windows binary and create draft release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist/package | Out-Null
+          Copy-Item "target/release/ch-rzl-rust.exe" "dist/package/"
+          if (Test-Path "README.md") { Copy-Item "README.md" "dist/package/" }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "dist/package/" }
+          if (Test-Path "rizline.ttf") { Copy-Item "rizline.ttf" "dist/package/" }
+          if (Test-Path "audio") { Copy-Item "audio" "dist/package/audio" -Recurse }
+          if (Test-Path "ffmpeg.exe") { Copy-Item "ffmpeg.exe" "dist/package/" }
+          if (Test-Path "ffplay.exe") { Copy-Item "ffplay.exe" "dist/package/" }
+          Compress-Archive -Path dist/package/* -DestinationPath "dist/ch-rzl-rust-windows-x86_64.zip" -Force
+
+      - name: Create or update draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Draft build ${{ github.run_number }}
+          body: |
+            Automated draft release for commit `${{ github.sha }}`.
+
+            Branch: `${{ github.ref_name }}`
+            Workflow run: `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
+          draft: true
+          prerelease: false
+          files: dist/ch-rzl-rust-windows-x86_64.zip
+          fail_on_unmatched_files: true

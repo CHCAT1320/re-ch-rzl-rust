@@ -1,0 +1,25 @@
+[package]
+name = "ch-rzl-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+macroquad = "0.4.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+rfd = "0.15"
+
+# sasa for audio management
+sasa = { git = "https://github.com/Mivik/sasa", features = ["cpal"] }
+anyhow = "1.0"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
