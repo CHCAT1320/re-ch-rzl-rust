@@ -32,6 +32,17 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Read package version
+        id: package-version
+        shell: pwsh
+        run: |
+          $versionLine = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $versionLine) {
+            throw "Unable to find package version in Cargo.toml"
+          }
+          $version = $versionLine.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+
       - name: Build release binary
         run: cargo build --release --locked
 
@@ -51,10 +62,12 @@ jobs:
       - name: Create or update draft release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Draft build ${{ github.run_number }}
+          tag_name: ${{ steps.package-version.outputs.version }}
+          name: v${{ steps.package-version.outputs.version }}
           body: |
-            Automated draft release for commit `${{ github.sha }}`.
+            Automated draft release for version `${{ steps.package-version.outputs.version }}`.
+
+            Commit: `${{ github.sha }}`
 
             Branch: `${{ github.ref_name }}`
             Workflow run: `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`
