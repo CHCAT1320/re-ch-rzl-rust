@@ -903,6 +903,65 @@ impl Win32ProgressWindow {
     fn close(&self) {}
 }
 
+fn format_duration_text(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return "0秒".to_string();
+    }
+
+    let mut total_seconds = seconds.round() as u64;
+    let days = total_seconds / 86_400;
+    total_seconds %= 86_400;
+    let hours = total_seconds / 3_600;
+    total_seconds %= 3_600;
+    let minutes = total_seconds / 60;
+    let secs = total_seconds % 60;
+
+    if days > 0 {
+        format!("{}天{}时{}分{}秒", days, hours, minutes, secs)
+    } else if hours > 0 {
+        format!("{}时{}分{}秒", hours, minutes, secs)
+    } else if minutes > 0 {
+        format!("{}分{}秒", minutes, secs)
+    } else {
+        format!("{}秒", secs)
+    }
+}
+
+fn chart_note_count(chart: &Chart) -> usize {
+    chart.lines.iter().map(|line| line.notes.len()).sum()
+}
+
+#[cfg(target_os = "windows")]
+fn show_windows_notification(title: &str, body: &str) {
+    let script = r#"
+$ErrorActionPreference = 'SilentlyContinue'
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+[Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null
+
+$template = [Windows.UI.Notifications.ToastTemplateType]::ToastText02
+$xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent($template)
+$textNodes = $xml.GetElementsByTagName('text')
+[void]$textNodes.Item(0).AppendChild($xml.CreateTextNode($env:RE_CH_RZL_TOAST_TITLE))
+[void]$textNodes.Item(1).AppendChild($xml.CreateTextNode($env:RE_CH_RZL_TOAST_BODY))
+
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('RE:CH-RZL-RUST').Show($toast)
+"#;
+
+    let _ = Command::new("powershell")
+        .arg("-NoProfile")
+        .arg("-WindowStyle")
+        .arg("Hidden")
+        .arg("-Command")
+        .arg(script)
+        .env("RE_CH_RZL_TOAST_TITLE", title)
+        .env("RE_CH_RZL_TOAST_BODY", body)
+        .spawn();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_windows_notification(_title: &str, _body: &str) {}
+
 fn chart_duration_seconds(chart: &Chart) -> f64 {
     let mut max_tick = 0.0f64;
 
@@ -1663,7 +1722,34 @@ async fn run_render_export(app: &mut AppState, mut config: RenderExportConfig) -
 
     let duration = chart_duration_seconds(&chart);
     let frame_count = (duration * config.fps as f64).ceil() as u32;
+    let note_count = chart_note_count(&chart);
     println!("Rendering {:.2}s, {} frames", duration, frame_count);
+
+    let chart_name = Path::new(&config.chart_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&config.chart_path);
+    let audio_name = if config.bgm_path.is_empty() {
+        "(none)"
+    } else {
+        Path::new(&config.bgm_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&config.bgm_path)
+    };
+    show_windows_notification(
+        "RE:CH-RZL-RUST 开始渲染",
+        &format!(
+            "谱面：{}\n音频：{}\n线条：{} | 音符：{} | 时长：{} | 帧率：{} FPS\n输出：{}",
+            chart_name,
+            audio_name,
+            chart.lines.len(),
+            note_count,
+            format_duration_text(duration),
+            config.fps,
+            config.output_path
+        ),
+    );
 
     // Create the Win7-style progress dialog before audio mixing so both the
     // audio mix phase and the frame render phase are visible and cancellable.
@@ -1754,14 +1840,46 @@ async fn run_render_export(app: &mut AppState, mut config: RenderExportConfig) -
         ));
     }
 
-    println!("Encoding elapsed: {:.2}s", encode_start.elapsed().as_secs_f64());
+    let encode_elapsed = encode_start.elapsed().as_secs_f64();
+    let total_elapsed = total_start.elapsed().as_secs_f64();
+    let render_elapsed = render_start.elapsed().as_secs_f64();
+    let avg_frame_rate = if total_elapsed > 0.0 {
+        frame_count as f64 / total_elapsed
+    } else {
+        0.0
+    };
+    let avg_pipe_rate = if render_elapsed > 0.0 {
+        frame_count as f64 / render_elapsed
+    } else {
+        0.0
+    };
+
+    println!("Encoding elapsed: {:.2}s", encode_elapsed);
 
     if let Some(path) = mixed_audio {
         println!("Mixed audio saved: {}", path.display());
     }
 
     println!("Render completed: {}", config.output_path);
-    println!("Total render time: {:.2}s", total_start.elapsed().as_secs_f64());
+    println!("Total render time: {:.2}s", total_elapsed);
+    println!(
+        "Average render speed: {:.1} fps/s total | {:.1} fps/s frame pipe",
+        avg_frame_rate, avg_pipe_rate
+    );
+
+    show_windows_notification(
+        "RE:CH-RZL-RUST 渲染完成",
+        &format!(
+            "输出：{}\n总用时：{} | 编码收尾：{}\n总帧数：{} | 平均：{:.1} fps/s\n画面写入平均：{:.1} fps/s",
+            config.output_path,
+            format_duration_text(total_elapsed),
+            format_duration_text(encode_elapsed),
+            frame_count,
+            avg_frame_rate,
+            avg_pipe_rate
+        ),
+    );
+
     Ok(())
 }
 
