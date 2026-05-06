@@ -129,6 +129,19 @@ fn get_current_line_color(line_color: &[LineColor], tick: f64) -> Option<crate::
     Some(current)
 }
 
+fn get_current_judge_ring_color(
+    judge_ring_color: &[LineColor],
+    tick: f64,
+) -> Option<crate::chart::Color> {
+    if let Some(last) = judge_ring_color.last() {
+        if tick > last.time {
+            return Some(last.end_color);
+        }
+    }
+
+    get_current_line_color(judge_ring_color, tick)
+}
+
 fn calculate_mixed_color(
     tick: f64,
     point_color: &crate::chart::Color,
@@ -154,6 +167,37 @@ fn calculate_combo(comb: u32) -> u32 {
         return 3 * comb - 13;
     }
     4 * comb - 24
+}
+
+fn hit_effect_color(chart: &Chart, tick: f64) -> crate::chart::Color {
+    let default_color = crate::chart::Color {
+        r: 255,
+        g: 255,
+        b: 255,
+        a: 255,
+    };
+
+    match get_challenge_time_index(tick, chart) {
+        Some(idx) => chart
+            .themes
+            .get(idx + 1)
+            .and_then(|theme| theme.colors_list.get(2))
+            .copied()
+            .or_else(|| {
+                chart
+                    .themes
+                    .get(0)
+                    .and_then(|theme| theme.colors_list.get(2))
+                    .copied()
+            })
+            .unwrap_or(default_color),
+        None => chart
+            .themes
+            .get(0)
+            .and_then(|theme| theme.colors_list.get(2))
+            .copied()
+            .unwrap_or(default_color),
+    }
 }
 
 /// 判断线段是否与可见矩形相交。
@@ -309,6 +353,7 @@ pub struct NoteRuntime {
     pub fp: f64,
     pub is_hit: bool,
     pub is_play_hit: bool,
+    pub is_play_hold_end_hit: bool,
 }
 
 // ==================== Hit Effect ====================
@@ -321,10 +366,18 @@ pub struct HitEffect {
     pub block_count: u32,
     pub blocks_r: Vec<f64>,
     pub block_s: Vec<f64>,
+    pub riztime_offsets: Vec<f64>,
+    pub riztime_sizes: Vec<f64>,
 }
 
 impl HitEffect {
-    fn new(tick_timer: f64, x: f64, color: crate::chart::Color, is_bad: bool) -> Self {
+    fn new(
+        tick_timer: f64,
+        x: f64,
+        color: crate::chart::Color,
+        is_bad: bool,
+        in_challenge_time: bool,
+    ) -> Self {
         // Match the original JS behavior:
         // blockCount = Math.floor(Math.random() * 2) + 3
         // blocksR    = Math.floor(Math.random() * 361)
@@ -336,6 +389,22 @@ impl HitEffect {
             blocks_r.push(macroquad::rand::gen_range(0.0, 361.0));
             block_s.push(macroquad::rand::gen_range(10.0, 30.0));
         }
+
+        let mut riztime_offsets = Vec::new();
+        let mut riztime_sizes = Vec::new();
+        if in_challenge_time {
+            // Original JS challenge-time extra particles:
+            // for (let i = 0; i < Math.floor(Math.random() * 5) + 1; i++) {
+            //     rBOffset.push(Math.random() * 440)
+            //     rBS.push(Math.floor(Math.random() * 10) + 10)
+            // }
+            let count: i32 = macroquad::rand::gen_range(1, 6);
+            for _ in 0..count {
+                riztime_offsets.push(macroquad::rand::gen_range(0.0, 440.0));
+                riztime_sizes.push(macroquad::rand::gen_range(10.0, 20.0));
+            }
+        }
+
         Self {
             x,
             timer: tick_timer,
@@ -344,6 +413,8 @@ impl HitEffect {
             block_count,
             blocks_r,
             block_s,
+            riztime_offsets,
+            riztime_sizes,
         }
     }
 }
@@ -407,6 +478,7 @@ impl RenderPipeline {
                     fp,
                     is_hit: false,
                     is_play_hit: false,
+                    is_play_hold_end_hit: false,
                 });
             }
         }
@@ -707,11 +779,13 @@ impl RenderPipeline {
                             let cx = (x + ease_val * (x1 - x)) as f32;
 
                             if !line.judge_ring_color.is_empty() {
-                                if let Some(jc) = get_current_line_color(&line.judge_ring_color, tick)
+                                if let Some(jc) =
+                                    get_current_judge_ring_color(&line.judge_ring_color, tick)
                                 {
                                     // 判定圈颜色独立使用 judgeRingColor 当前关键帧颜色。
                                     // 不再与 lineColor 混合；若当前 tick 小于第一个颜色事件 time，
                                     // get_current_line_color 会返回第一个事件的 startColor。
+                                    // 若当前 tick 大于最后一个颜色事件 time，则固定为最后事件的 endColor。
                                     let ring_color = chart_to_quad_color(&jc);
                                     judge_rings.push((cx, ring_color));
                                 }
@@ -807,20 +881,6 @@ impl RenderPipeline {
             let canvas = &self.canvases[ci];
             let canvas2 = &self.canvases[ci2];
 
-            // Early return for already-hit notes. Keep combo count but avoid old off-screen draw work.
-            if note.is_hit && tick > info.time && info.note_type != 2 {
-                hit_count += 1;
-                continue;
-            }
-            if note.is_hit
-                && info.note_type == 2
-                && !info.other_informations.is_empty()
-                && tick >= info.other_informations[0] + 0.5
-            {
-                hit_count += 1;
-                continue;
-            }
-
             let ease_fn = if p1.ease_type < EASE_FUNCS.len() as u32 {
                 EASE_FUNCS[p1.ease_type as usize]
             } else {
@@ -911,21 +971,63 @@ impl RenderPipeline {
                 };
 
                 let timer = tick_to_seconds(tick, chart);
-                self.hit_effects
-                    .push(HitEffect::new(timer, x, effect_color, false));
+                self.hit_effects.push(HitEffect::new(
+                    timer,
+                    x,
+                    effect_color,
+                    false,
+                    get_challenge_time_index(tick, chart).is_some(),
+                ));
+            }
+
+            if info.note_type == 2 && !info.other_informations.is_empty() {
+                let end_time = info.other_informations[0];
+                if tick < end_time {
+                    note.is_play_hold_end_hit = false;
+                } else if !note.is_play_hold_end_hit {
+                    note.is_play_hold_end_hit = true;
+                    let effect_color = hit_effect_color(chart, tick);
+                    let timer = tick_to_seconds(tick, chart);
+                    self.hit_effects.push(HitEffect::new(
+                        timer,
+                        x,
+                        effect_color,
+                        false,
+                        get_challenge_time_index(tick, chart).is_some(),
+                    ));
+                }
             }
 
             if tick < info.time {
                 note.is_hit = false;
                 note.is_play_hit = false;
+                note.is_play_hold_end_hit = false;
             } else {
                 note.is_hit = true;
             }
             if note.is_hit {
                 hit_count += 1;
-                if info.note_type == 2 {
+                if info.note_type == 2
+                    && !info.other_informations.is_empty()
+                    && tick >= info.other_informations[0]
+                {
                     hit_count += 1;
                 }
+            }
+
+            // Skip drawing notes that are already fully resolved, but only after
+            // hit/hold-end sound effects and combo state have been updated. This
+            // prevents off-screen/expired optimization from swallowing hit events
+            // when a frame jumps past the note or hold end time.
+            if note.is_hit && tick > info.time && info.note_type != 2 {
+                continue;
+            }
+            if note.is_hit
+                && info.note_type == 2
+                && !info.other_informations.is_empty()
+                && tick >= info.other_informations[0] + 0.5
+            {
+                continue;
             }
 
             // Calculate Y position
@@ -1010,11 +1112,11 @@ impl RenderPipeline {
             let hold_scale = Self::get_hold_head_scale(tick, &info);
             let wh = if info.note_type == 1 {
                 // Drag 比 Tap 小一点。
-                16.0 * scale * hold_scale * (screen_w / 360.0)
-            } else if info.note_type == 2 {
                 18.0 * scale * hold_scale * (screen_w / 360.0)
+            } else if info.note_type == 2 {
+                23.0 * scale * hold_scale * (screen_w / 360.0)
             } else {
-                20.0 * scale * hold_scale * (screen_w / 360.0)
+                25.0 * scale * hold_scale * (screen_w / 360.0)
             };
 
             let note_color = if info.note_type == 1 || info.note_type == 2 {
@@ -1039,14 +1141,14 @@ impl RenderPipeline {
             }
 
             // Draw note head on top of hold body.
-            draw_circle(x as f32, y as f32, (wh / 2.0) as f32, note_color);
-            draw_circle_lines(
-                x as f32,
-                y as f32,
-                (wh / 2.0) as f32,
-                (3.0 * scale * (screen_w / 360.0)) as f32,
-                BLACK,
-            );
+            // Keep the total visual note size unchanged: draw the black border
+            // inside the original radius, then draw the colored/white fill smaller.
+            let note_radius = (wh / 2.0) as f32;
+            let border_base = if info.note_type == 1 { 3.0 } else { 5.0 };
+            let border_width = (border_base * scale * (screen_w / 360.0)) as f32;
+            let inner_radius = (note_radius - border_width).max(0.0);
+            draw_circle(x as f32, y as f32, note_radius, BLACK);
+            draw_circle(x as f32, y as f32, inner_radius, note_color);
         }
 
         // ==================== Combo ====================
@@ -1163,11 +1265,11 @@ impl RenderPipeline {
         let timer = tick_to_seconds(tick, chart);
         self.hit_effects.retain(|effect| {
             let dt = timer - effect.timer;
-            if dt > 0.5 || dt < 0.0 {
+            if dt > 0.7 || dt < 0.0 {
                 return false;
             }
 
-            let t = dt / 0.5;
+            let t = dt / 0.7;
             let ease_val = EASE_FUNCS[11](t); // easeOutQuint
 
             let size =
@@ -1225,6 +1327,36 @@ impl RenderPipeline {
                 );
             }
 
+            // Challenge time extra particles from the original web version:
+            // drawRiztimeBolock() emits 1..5 small circles that fly vertically upward
+            // from the hit position while shrinking/fading.
+            for i in 0..effect.riztime_offsets.len() {
+                let wh = effect.riztime_sizes[i] * scale * (screen_w / 360.0);
+                let offset = wh / 2.0;
+                let block_offset = ease_val * effect.riztime_offsets[i] * scale * (screen_w / 360.0);
+                let by = -(block_offset - offset);
+                let block_decay = EASE_FUNCS[10](t);
+                let ba = (1.0 - block_decay).max(0.0);
+
+                let block_color = if effect.is_bad {
+                    Color::new(0.0, 0.0, 0.0, ba as f32)
+                } else {
+                    Color::new(
+                        effect.color.r as f32 / 255.0,
+                        effect.color.g as f32 / 255.0,
+                        effect.color.b as f32 / 255.0,
+                        ba as f32,
+                    )
+                };
+
+                draw_circle(
+                    effect.x as f32,
+                    by as f32,
+                    (wh * (1.0 - block_decay) / 2.0) as f32,
+                    block_color,
+                );
+            }
+
             true
         });
     }
@@ -1271,21 +1403,50 @@ impl RenderPipeline {
         if h.abs() < 0.1 {
             return;
         }
-        let w = 10.0 * scale * (screen_w / 360.0);
-        let draw_y = y.min(end_y);
-        let draw_h = h.abs();
+        let w = 14.0 * scale * (screen_w / 360.0);
 
         let qc = chart_to_quad_color(color);
-        draw_rectangle(
-            (x - w / 2.0) as f32,
-            draw_y as f32,
-            w as f32,
-            draw_h as f32,
-            qc,
-        );
+
+        // Fill: keep the first 2/3 of the hold body opaque, then fade the final
+        // 1/3 from opaque to fully transparent toward the tail.
+        let fade_start = y + h * 0.6;
+        let opaque_y = y.min(fade_start);
+        let opaque_h = (fade_start - y).abs();
+        if opaque_h > 0.1 {
+            draw_rectangle(
+                (x - w / 2.0) as f32,
+                opaque_y as f32,
+                w as f32,
+                opaque_h as f32,
+                qc,
+            );
+        }
+
+        const HOLD_FADE_STEPS: usize = 24;
+        for i in 0..HOLD_FADE_STEPS {
+            let t0 = i as f64 / HOLD_FADE_STEPS as f64;
+            let t1 = (i + 1) as f64 / HOLD_FADE_STEPS as f64;
+            let seg_y0 = fade_start + (end_y - fade_start) * t0;
+            let seg_y1 = fade_start + (end_y - fade_start) * t1;
+            let seg_y = seg_y0.min(seg_y1);
+            let seg_h = (seg_y1 - seg_y0).abs();
+
+            if seg_h <= 0.1 {
+                continue;
+            }
+
+            let alpha = (1.0 - (t0 + t1) * 0.5).clamp(0.0, 1.0) as f32;
+            draw_rectangle(
+                (x - w / 2.0) as f32,
+                seg_y as f32,
+                w as f32,
+                seg_h as f32,
+                Color::new(qc.r, qc.g, qc.b, qc.a * alpha),
+            );
+        }
 
         // Borders
-        let border_w = (2.0 * scale) as f32;
+        let border_w = (3.0 * scale * (screen_w / 360.0)) as f32;
         draw_line(
             (x - w / 2.0) as f32,
             y as f32,

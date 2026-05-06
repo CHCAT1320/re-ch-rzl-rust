@@ -1,12 +1,17 @@
 use anyhow::Result;
-use sasa::{AudioClip, AudioManager, MusicParams, PlaySfxParams, Sfx};
 use sasa::backend::cpal::{CpalBackend, CpalSettings};
+use sasa::{AudioClip, AudioManager, MusicParams, PlaySfxParams, Sfx};
+
+const EMBEDDED_HIT_WAV: &[u8] = include_bytes!("../audio/hit.wav");
+const EMBEDDED_DRAG_WAV: &[u8] = include_bytes!("../audio/drag.wav");
 
 /// Audio controller using sasa library for audio management
 pub struct AudioController {
     manager: Option<AudioManager>,
     bgm: Option<sasa::Music>,
+    bgm_clip: Option<AudioClip>,
     bgm_duration: f64,
+    bgm_playback_rate: f32,
     hit_sfx: Option<Sfx>,
     drag_sfx: Option<Sfx>,
 }
@@ -16,7 +21,9 @@ impl AudioController {
         AudioController {
             manager: None,
             bgm: None,
+            bgm_clip: None,
             bgm_duration: 0.0,
+            bgm_playback_rate: 1.0,
             hit_sfx: None,
             drag_sfx: None,
         }
@@ -26,20 +33,20 @@ impl AudioController {
     pub fn init(&mut self, custom_bgm_path: &str) -> Result<()> {
         let mut manager = AudioManager::new(CpalBackend::new(CpalSettings::default()))?;
 
-        // Load hit sound effect
-        if let Ok(data) = std::fs::read("audio/hit.wav") {
-            if let Ok(clip) = AudioClip::new(data) {
-                self.hit_sfx = Some(manager.create_sfx(clip, None)?);
-                log::info!("Loaded audio/hit.wav");
-            }
+        // Load embedded hit sound effect. Prefer external files during development,
+        // but keep a compiled-in fallback so the release exe can run standalone.
+        let hit_data = std::fs::read("audio/hit.wav").unwrap_or_else(|_| EMBEDDED_HIT_WAV.to_vec());
+        if let Ok(clip) = AudioClip::new(hit_data) {
+            self.hit_sfx = Some(manager.create_sfx(clip, None)?);
+            log::info!("Loaded hit sound effect");
         }
 
-        // Load drag sound effect
-        if let Ok(data) = std::fs::read("audio/drag.wav") {
-            if let Ok(clip) = AudioClip::new(data) {
-                self.drag_sfx = Some(manager.create_sfx(clip, None)?);
-                log::info!("Loaded audio/drag.wav");
-            }
+        // Load embedded drag sound effect. Prefer external files during development,
+        // but keep a compiled-in fallback so the release exe can run standalone.
+        let drag_data = std::fs::read("audio/drag.wav").unwrap_or_else(|_| EMBEDDED_DRAG_WAV.to_vec());
+        if let Ok(clip) = AudioClip::new(drag_data) {
+            self.drag_sfx = Some(manager.create_sfx(clip, None)?);
+            log::info!("Loaded drag sound effect");
         }
 
         // Load background music
@@ -55,14 +62,15 @@ impl AudioController {
                 self.bgm_duration = estimate_audio_duration(&bgm_path, &data).unwrap_or(0.0);
                 if let Ok(clip) = AudioClip::new(data) {
                     let music = manager.create_music(
-                        clip,
+                        clip.clone(),
                         MusicParams {
                             loop_mix_time: -1.0,
                             amplifier: 0.5,
-                            playback_rate: 1.0,
+                            playback_rate: self.bgm_playback_rate,
                             command_buffer_size: 16,
                         },
                     )?;
+                    self.bgm_clip = Some(clip);
                     self.bgm = Some(music);
                     log::info!("Loaded BGM: {} ({:.2}s)", bgm_path, self.bgm_duration);
                 }
@@ -134,6 +142,58 @@ impl AudioController {
         if let Some(ref mut music) = self.bgm {
             let _ = music.set_amplifier(volume.clamp(0.0, 1.0));
         }
+    }
+
+    /// Set BGM playback speed. The sasa Music API only accepts playback_rate
+    /// when a Music object is created, so recreate the Music while preserving
+    /// the current position and paused/playing state.
+    pub fn set_bgm_playback_rate(&mut self, rate: f32) -> f32 {
+        let rate = rate.clamp(0.5, 2.0);
+        if (rate - self.bgm_playback_rate).abs() < f32::EPSILON {
+            return self.bgm_playback_rate;
+        }
+
+        self.bgm_playback_rate = rate;
+
+        let Some(manager) = self.manager.as_mut() else {
+            return self.bgm_playback_rate;
+        };
+        let Some(clip) = self.bgm_clip.clone() else {
+            return self.bgm_playback_rate;
+        };
+
+        let (position, was_paused) = if let Some(ref mut music) = self.bgm {
+            (music.position(), music.paused())
+        } else {
+            (0.0, true)
+        };
+
+        match manager.create_music(
+            clip,
+            MusicParams {
+                loop_mix_time: -1.0,
+                amplifier: 0.5,
+                playback_rate: self.bgm_playback_rate,
+                command_buffer_size: 16,
+            },
+        ) {
+            Ok(mut music) => {
+                let _ = music.seek_to(position);
+                if !was_paused {
+                    let _ = music.play();
+                }
+                self.bgm = Some(music);
+            }
+            Err(e) => {
+                log::warn!("Failed to change BGM playback rate: {}", e);
+            }
+        }
+
+        self.bgm_playback_rate
+    }
+
+    pub fn get_bgm_playback_rate(&self) -> f32 {
+        self.bgm_playback_rate
     }
 
     /// Get current BGM playback position in seconds

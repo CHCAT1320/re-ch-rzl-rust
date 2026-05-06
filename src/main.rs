@@ -11,10 +11,16 @@ use chart::Chart;
 use render::{RenderPipeline, RenderSettings, CANVAS_WIDTH, CANVAS_HEIGHT};
 use audio::AudioController;
 use time_conv::{seconds_to_tick, tick_to_seconds};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
+
+const EMBEDDED_RIZLINE_TTF: &[u8] = include_bytes!("../rizline.ttf");
+const EMBEDDED_RENDER_HIT_WAV: &[u8] = include_bytes!("../audio/hit.wav");
+const EMBEDDED_RENDER_DRAG_WAV: &[u8] = include_bytes!("../audio/drag.wav");
 
 const WINDOW_W: u32 = 450;
 // Keep enough room for title bar + common Windows taskbar while staying close
@@ -142,6 +148,7 @@ struct AppState {
     audio: AudioController,
     is_playing: bool,
     start_time: f64,
+    playback_position: f64,
     fps_counter: u32,
     fps_time: f64,
     current_fps: u32,
@@ -150,6 +157,7 @@ struct AppState {
     audio_initialized: bool,
     font: Option<Font>,
     window_positioned: bool,
+    ime_disabled: bool,
 }
 
 impl AppState {
@@ -167,6 +175,7 @@ impl AppState {
             audio: AudioController::new(),
             is_playing: false,
             start_time: 0.0,
+            playback_position: 0.0,
             fps_counter: 0,
             fps_time: 0.0,
             current_fps: 0,
@@ -175,6 +184,7 @@ impl AppState {
             audio_initialized: false,
             font: None,
             window_positioned: false,
+            ime_disabled: false,
         }
     }
 
@@ -258,22 +268,38 @@ impl AppState {
         }
         self.init_audio();
 
-        if let Some(ref chart) = self.chart {
-            self.pipeline = Some(RenderPipeline::new(chart));
-            if let Some(ref mut pipeline) = self.pipeline {
-                for canvas in pipeline.canvases.iter_mut() {
-                    canvas.init_fp(chart);
+        if self.pipeline.is_none() {
+            if let Some(ref chart) = self.chart {
+                self.pipeline = Some(RenderPipeline::new(chart));
+                if let Some(ref mut pipeline) = self.pipeline {
+                    for canvas in pipeline.canvases.iter_mut() {
+                        canvas.init_fp(chart);
+                    }
                 }
             }
         }
+
         self.is_playing = true;
-        self.start_time = get_time();
+        self.start_time = get_time() - self.playback_position;
         self.audio.play_bgm();
         self.set_message("Playing...".to_string());
     }
 
+    fn pause_play(&mut self) {
+        if !self.is_playing {
+            return;
+        }
+
+        self.playback_position = self.get_current_timer();
+        self.is_playing = false;
+        self.audio.pause_bgm();
+        self.set_message("Paused".to_string());
+    }
+
     fn stop_play(&mut self) {
         self.is_playing = false;
+        self.start_time = 0.0;
+        self.playback_position = 0.0;
         self.pipeline = None;
         self.audio.stop();
         self.set_message("Stopped".to_string());
@@ -318,22 +344,35 @@ impl AppState {
         }
         if is_key_pressed(KeyCode::Space) {
             if self.chart.is_some() {
-                if self.is_playing { self.stop_play(); } else { self.start_play(); }
+                if self.is_playing { self.pause_play(); } else { self.start_play(); }
             }
         }
         if is_key_pressed(KeyCode::PageUp) {
-            self.audio.set_bgm_volume(0.8);
-            self.set_message("BGM Vol: 80%".to_string());
+            let rate = self.audio.get_bgm_playback_rate() + 0.05;
+            let rate = self.audio.set_bgm_playback_rate(rate);
+            self.set_message(format!("Music Speed: {:.2}x", rate));
         }
         if is_key_pressed(KeyCode::PageDown) {
-            self.audio.set_bgm_volume(0.3);
-            self.set_message("BGM Vol: 30%".to_string());
+            let rate = self.audio.get_bgm_playback_rate() - 0.05;
+            let rate = self.audio.set_bgm_playback_rate(rate);
+            self.set_message(format!("Music Speed: {:.2}x", rate));
         }
     }
 
-    fn get_current_timer(&self) -> f64 {
-        if !self.is_playing { return 0.0; }
-        get_time() - self.start_time
+    fn get_current_timer(&mut self) -> f64 {
+        if self.is_playing {
+            if self.audio_initialized && self.audio.is_bgm_playing() {
+                let audio_position = self.audio.get_bgm_position();
+                self.playback_position = audio_position;
+                audio_position
+            } else {
+                let timer = get_time() - self.start_time;
+                self.playback_position = timer;
+                timer
+            }
+        } else {
+            self.playback_position
+        }
     }
 
     #[cfg(target_os = "windows")]
@@ -391,6 +430,20 @@ impl AppState {
     #[cfg(not(target_os = "windows"))]
     fn center_window_on_windows(&mut self) {
         self.window_positioned = true;
+    }
+
+    #[cfg(target_os = "windows")]
+    fn disable_ime_on_windows(&mut self) {
+        if self.ime_disabled {
+            return;
+        }
+
+        self.ime_disabled = disable_window_ime_by_title("RE:CH-RZL-RUST Player");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn disable_ime_on_windows(&mut self) {
+        self.ime_disabled = true;
     }
 
     fn render_chart_frame(&mut self, timer: f64, with_audio_recovery: bool) {
@@ -452,26 +505,20 @@ impl AppState {
 
     fn render(&mut self) {
         self.center_window_on_windows();
+        self.disable_ime_on_windows();
 
         let window_w = screen_width();
         let window_h = screen_height();
 
+        let timer = self.get_current_timer();
         if self.is_playing {
-            self.render_chart_frame(self.get_current_timer(), true);
+            self.render_chart_frame(timer, true);
+        } else if self.pipeline.is_some() {
+            // Paused: keep rendering the full chart at the frozen playback position.
+            // Do not run audio recovery here, so BGM remains paused.
+            self.render_chart_frame(timer, false);
         } else {
             clear_background(BLACK);
-            if let (Some(ref chart), Some(ref pipeline)) = (&self.chart, &self.pipeline) {
-                let screen_w = CANVAS_WIDTH;
-                let screen_h = CANVAS_HEIGHT;
-                let offset_y = 160.0 * (screen_h / 640.0);
-                let left = -screen_w / 2.0;
-                let top = -screen_h / 2.0 - offset_y;
-                let mut camera = Camera2D::from_display_rect(Rect::new(left, top, screen_w, screen_h));
-                camera.zoom.y = -camera.zoom.y;
-                set_camera(&camera);
-                pipeline.draw_background(chart, 0.0);
-                set_default_camera();
-            }
         }
 
         // UI layer (screen-space coordinates with origin at top-left)
@@ -540,6 +587,7 @@ impl AppState {
         y_pos += line_height;
 
         let status = if self.is_playing { "Playing..." }
+            else if self.chart.is_some() && self.playback_position > 0.0 { "Paused (Space to resume)" }
             else if self.chart.is_some() { "Loaded (Space to play)" }
             else { "No chart (O/C to select)" };
         self.draw_text_with_font(status, 10.0, y_pos, 20.0, YELLOW);
@@ -595,14 +643,14 @@ impl AppState {
         }
 
         let hints = [
-            "SPACE: Play/Stop",
+            "SPACE: Play/Pause",
             "Up/Down: Speed",
             "R: Revelation",
             "D: Debug",
             "O: Open chart+audio",
             "C/B: Chart/Audio",
             "L: Reload",
-            "PgUp/PgDn: Vol",
+            "PgUp/PgDn: Music Speed",
             "ESC: Stop",
         ];
         let hint_alpha = if self.is_playing {
@@ -630,6 +678,31 @@ impl AppState {
 }
 
 #[cfg(target_os = "windows")]
+fn disable_window_ime_by_title(title: &str) -> bool {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Input::Ime::{ImmAssociateContext, HIMC};
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+
+    let title: Vec<u16> = OsStr::new(title).encode_wide().chain(Some(0)).collect();
+    let hwnd = unsafe { FindWindowW(None, PCWSTR(title.as_ptr())).unwrap_or(HWND::default()) };
+
+    if hwnd == HWND::default() {
+        return false;
+    }
+
+    unsafe {
+        // Detach the IME context from the Macroquad game window so shortcut
+        // keys such as C/B/L/R/D do not open Chinese IME composition/candidate UI.
+        let _ = ImmAssociateContext(hwnd, HIMC(std::ptr::null_mut()));
+    }
+
+    true
+}
+
+#[cfg(target_os = "windows")]
 fn find_renderer_window() -> windows::Win32::Foundation::HWND {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
@@ -646,20 +719,20 @@ fn find_renderer_window() -> windows::Win32::Foundation::HWND {
 }
 
 #[cfg(target_os = "windows")]
-fn hide_render_window() {
+fn minimize_console_window() {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_MINIMIZE};
 
-    let hwnd = find_renderer_window();
+    let hwnd = unsafe { windows::Win32::System::Console::GetConsoleWindow() };
     if hwnd != HWND::default() {
         unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
+            let _ = ShowWindow(hwnd, SW_MINIMIZE);
         }
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn hide_render_window() {}
+fn minimize_console_window() {}
 
 #[cfg(target_os = "windows")]
 struct TaskbarProgress {
@@ -731,21 +804,21 @@ impl TaskbarProgress {
     fn clear(&self) {}
 }
 
-#[cfg(target_os = "windows")]
+#[derive(Clone)]
+struct ExportProgressSnapshot {
+    line1: String,
+    line2: String,
+    line3: String,
+    done: u64,
+    total: u64,
+}
+
 struct Win32ProgressWindow {
-    dialog: Option<windows::Win32::UI::Shell::IProgressDialog>,
+    state: Rc<RefCell<ExportProgressSnapshot>>,
     started_at: Instant,
 }
 
-#[cfg(target_os = "windows")]
 impl Win32ProgressWindow {
-    fn wide(text: &str) -> Vec<u16> {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-
-        OsStr::new(text).encode_wide().chain(Some(0)).collect()
-    }
-
     fn format_duration(seconds: f64) -> String {
         if !seconds.is_finite() || seconds <= 0.0 {
             return "0秒".to_string();
@@ -771,52 +844,21 @@ impl Win32ProgressWindow {
     }
 
     fn new(total: u32, output_path: &str) -> Self {
-        use windows::core::{w, PCWSTR};
-        use windows::Win32::System::Com::{
-            CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
-        };
-        use windows::Win32::UI::Shell::{
-            IProgressDialog, CLSID_ProgressDialog, PDTIMER_RESET, PROGDLG_NOMINIMIZE,
-            PROGDLG_NORMAL,
-        };
-
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            let dialog =
-                CoCreateInstance::<_, IProgressDialog>(&CLSID_ProgressDialog, None, CLSCTX_INPROC_SERVER).ok();
-
-            if let Some(dlg) = &dialog {
-                let output = Self::wide(output_path);
-                let _ = dlg.SetTitle(w!("正在渲染"));
-                let _ = dlg.SetCancelMsg(w!("正在停止渲染，请稍候..."), None);
-                let _ = dlg.SetLine(1, w!("正在渲染 RE:CH-RZL-RUST 视频"), false, None);
-                let _ = dlg.SetLine(2, PCWSTR(output.as_ptr()), true, None);
-                let _ = dlg.SetLine(3, w!("准备中..."), false, None);
-                let _ = dlg.SetProgress64(0, total.max(1) as u64);
-                let _ = dlg.Timer(PDTIMER_RESET, None);
-                let _ = dlg.StartProgressDialog(
-                    None,
-                    None::<&windows::core::IUnknown>,
-                    PROGDLG_NORMAL | PROGDLG_NOMINIMIZE,
-                    None,
-                );
-            }
-
-            Self {
-                dialog,
-                started_at: Instant::now(),
-            }
+        Self {
+            state: Rc::new(RefCell::new(ExportProgressSnapshot {
+                line1: "正在渲染 RE:CH-RZL-RUST 视频".to_string(),
+                line2: output_path.to_string(),
+                line3: "准备中...".to_string(),
+                done: 0,
+                total: total.max(1) as u64,
+            })),
+            started_at: Instant::now(),
         }
     }
 
     fn set_stage(&self, stage: &str, detail: &str, done: u64, total: u64) {
-        use windows::core::PCWSTR;
-
-        let Some(dlg) = &self.dialog else {
-            return;
-        };
-
-        let pct = done as f64 * 100.0 / total.max(1) as f64;
+        let total = total.max(1);
+        let pct = done as f64 * 100.0 / total as f64;
         let elapsed = self.started_at.elapsed().as_secs_f64();
         let eta = if done > 0 && done < total {
             elapsed * (total - done) as f64 / done as f64
@@ -826,26 +868,19 @@ impl Win32ProgressWindow {
 
         let elapsed_text = Self::format_duration(elapsed);
         let eta_text = Self::format_duration(eta);
-        let stage = Self::wide(&format!("{} ({:.1}%)", stage, pct));
-        let time_line = Self::wide(&format!("已用时 {} | 预计剩余 {}", elapsed_text, eta_text));
-        let detail = Self::wide(detail);
 
-        unsafe {
-            let _ = dlg.SetLine(1, PCWSTR(stage.as_ptr()), false, None);
-            let _ = dlg.SetLine(2, PCWSTR(time_line.as_ptr()), false, None);
-            let _ = dlg.SetLine(3, PCWSTR(detail.as_ptr()), false, None);
-            let _ = dlg.SetProgress64(done.min(total), total.max(1));
-        }
+        *self.state.borrow_mut() = ExportProgressSnapshot {
+            line1: format!("{} ({:.1}%)", stage, pct),
+            line2: format!("已用时 {} | 预计剩余 {}", elapsed_text, eta_text),
+            line3: detail.to_string(),
+            done: done.min(total),
+            total,
+        };
     }
 
     fn set(&self, done: u32, total: u32, render_start: Instant) {
-        use windows::core::PCWSTR;
-
-        let Some(dlg) = &self.dialog else {
-            return;
-        };
-
-        let pct = done as f64 * 100.0 / total.max(1) as f64;
+        let total = total.max(1);
+        let pct = done as f64 * 100.0 / total as f64;
         let elapsed = render_start.elapsed().as_secs_f64();
         let render_fps = if elapsed > 0.0 {
             done as f64 / elapsed
@@ -860,46 +895,25 @@ impl Win32ProgressWindow {
 
         let elapsed_text = Self::format_duration(elapsed);
         let eta_text = Self::format_duration(eta);
-        let line1 = Self::wide(&format!(
-            "正在渲染帧 {}/{} ({:.1}%) | {:.1} fps/s",
-            done, total, pct, render_fps
-        ));
-        let line2 = Self::wide(&format!("已用时 {} | 预计剩余 {}", elapsed_text, eta_text));
-        let line3 = Self::wide("正在写入视频帧到 FFmpeg");
 
-        unsafe {
-            let _ = dlg.SetProgress64(done.min(total) as u64, total.max(1) as u64);
-            let _ = dlg.SetLine(1, PCWSTR(line1.as_ptr()), false, None);
-            let _ = dlg.SetLine(2, PCWSTR(line2.as_ptr()), false, None);
-            let _ = dlg.SetLine(3, PCWSTR(line3.as_ptr()), false, None);
-        }
+        *self.state.borrow_mut() = ExportProgressSnapshot {
+            line1: format!(
+                "正在渲染帧 {}/{} ({:.1}%) | {:.1} fps/s",
+                done, total, pct, render_fps
+            ),
+            line2: format!("已用时 {} | 预计剩余 {}", elapsed_text, eta_text),
+            line3: "正在写入视频帧到 FFmpeg".to_string(),
+            done: done.min(total) as u64,
+            total: total as u64,
+        };
     }
 
-    fn cancelled(&self) -> bool {
-        self.dialog
-            .as_ref()
-            .map(|dlg| unsafe { dlg.HasUserCancelled().as_bool() })
-            .unwrap_or(false)
+    fn snapshot(&self) -> ExportProgressSnapshot {
+        self.state.borrow().clone()
     }
 
-    fn close(&self) {
-        if let Some(dlg) = &self.dialog {
-            unsafe {
-                let _ = dlg.StopProgressDialog();
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-struct Win32ProgressWindow;
-
-#[cfg(not(target_os = "windows"))]
-impl Win32ProgressWindow {
-    fn new(_total: u32, _output_path: &str) -> Self { Self }
-    fn set_stage(&self, _stage: &str, _detail: &str, _done: u64, _total: u64) {}
-    fn set(&self, _done: u32, _total: u32, _render_start: Instant) {}
     fn cancelled(&self) -> bool { false }
+
     fn close(&self) {}
 }
 
@@ -1045,10 +1059,8 @@ fn collect_note_sfx_events(chart: &Chart) -> Vec<(u64, &'static str, f32)> {
     for line in &chart.lines {
         for note in &line.notes {
             if let Some((path, volume)) = sfx_path_for_note_type(note.note_type) {
-                if Path::new(path).exists() {
-                    let delay_ms = (tick_to_seconds(note.time, chart).max(0.0) * 1000.0).round() as u64;
-                    events.push((delay_ms, path, volume));
-                }
+                let delay_ms = (tick_to_seconds(note.time, chart).max(0.0) * 1000.0).round() as u64;
+                events.push((delay_ms, path, volume));
             }
         }
     }
@@ -1065,9 +1077,12 @@ struct Pcm16Stereo {
 
 fn read_wav_pcm16_stereo(path: &Path) -> Result<Pcm16Stereo, String> {
     let data = std::fs::read(path).map_err(|e| format!("Failed to read WAV {}: {e}", path.display()))?;
+    read_wav_pcm16_stereo_bytes(&data, &path.display().to_string())
+}
 
+fn read_wav_pcm16_stereo_bytes(data: &[u8], label: &str) -> Result<Pcm16Stereo, String> {
     if data.len() < 44 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
-        return Err(format!("Invalid WAV file: {}", path.display()));
+        return Err(format!("Invalid WAV file: {}", label));
     }
 
     let mut offset = 12usize;
@@ -1104,7 +1119,7 @@ fn read_wav_pcm16_stereo(path: &Path) -> Result<Pcm16Stereo, String> {
     if audio_format != 1 || channels != 2 || bits_per_sample != 16 || sample_rate == 0 || data_len == 0 {
         return Err(format!(
             "Unsupported WAV format {}: format={}, channels={}, bits={}, sample_rate={}, data_len={}",
-            path.display(),
+            label,
             audio_format,
             channels,
             bits_per_sample,
@@ -1122,6 +1137,20 @@ fn read_wav_pcm16_stereo(path: &Path) -> Result<Pcm16Stereo, String> {
         samples,
         sample_rate,
     })
+}
+
+fn load_sfx_pcm16_stereo(path: &'static str) -> Result<Pcm16Stereo, String> {
+    if Path::new(path).exists() {
+        return read_wav_pcm16_stereo(Path::new(path));
+    }
+
+    let embedded = match path {
+        "audio/hit.wav" => EMBEDDED_RENDER_HIT_WAV,
+        "audio/drag.wav" => EMBEDDED_RENDER_DRAG_WAV,
+        _ => return Err(format!("No embedded SFX for {}", path)),
+    };
+
+    read_wav_pcm16_stereo_bytes(embedded, path)
 }
 
 fn write_wav_pcm16_stereo(path: &Path, sample_rate: u32, samples: &[i16]) -> Result<(), String> {
@@ -1285,8 +1314,6 @@ fn make_mixed_audio(
 ) -> Result<Option<PathBuf>, String> {
     let out = exe_dir_output_path("render_mixed_audio.wav");
     let bgm_wav = PathBuf::from("target").join("render_bgm_44100_s16.wav");
-    let hit_wav = PathBuf::from("target").join("render_sfx_hit_44100_s16.wav");
-    let drag_wav = PathBuf::from("target").join("render_sfx_drag_44100_s16.wav");
     let _ = std::fs::create_dir_all("target");
 
     let sfx_events = collect_note_sfx_events(chart);
@@ -1356,37 +1383,23 @@ fn make_mixed_audio(
 
     let unique_sfx = ["audio/hit.wav", "audio/drag.wav"];
     for path in unique_sfx {
-        if !Path::new(path).exists() {
-            continue;
-        }
-
-        let output = if path.contains("hit") {
-            &hit_wav
-        } else {
-            &drag_wav
-        };
-
         progress.set_stage(
-            "正在解码打击音效",
-            &format!("解码 {}", path),
+            "正在读取打击音效",
+            &format!("读取 {}", path),
             sfx_decode_done,
             100,
         );
         taskbar.set(sfx_decode_done, 100);
 
-        ffmpeg_decode_to_wav(
-            ffmpeg,
-            Some(Path::new(path)),
-            output,
-            None,
-            "正在解码打击音效",
-            progress,
-            taskbar,
-            sfx_decode_done,
-            (sfx_decode_done + 5).min(50),
-        )?;
+        match load_sfx_pcm16_stereo(path) {
+            Ok(sfx) => {
+                sfx_cache.insert(path, sfx);
+            }
+            Err(e) => {
+                println!("Skip SFX {}: {}", path, e);
+            }
+        }
 
-        sfx_cache.insert(path, read_wav_pcm16_stereo(output)?);
         sfx_decode_done = (sfx_decode_done + 5).min(50);
     }
 
@@ -1545,56 +1558,31 @@ fn spawn_ffmpeg_rawvideo(
 
 fn draw_export_progress_ui(
     app: &AppState,
-    done: u32,
-    total: u32,
-    render_start: Instant,
+    progress: &Win32ProgressWindow,
     output_path: &str,
 ) {
     set_default_camera();
     clear_background(Color::new(0.06, 0.06, 0.08, 1.0));
 
-    let pct = done as f32 / total.max(1) as f32;
-    let elapsed = render_start.elapsed().as_secs_f32();
-    let eta = if done > 0 {
-        elapsed * (total - done) as f32 / done as f32
-    } else {
-        0.0
-    };
+    let snapshot = progress.snapshot();
+    let pct = snapshot.done as f32 / snapshot.total.max(1) as f32;
 
-    app.draw_text_with_font("RE:CH-RZL-RUST Renderer", 24.0, 36.0, 24.0, WHITE);
+    app.draw_text_with_font("RE:CH-RZL-RUST Renderer", 24.0, 32.0, 24.0, WHITE);
     app.draw_text_with_font(
         &format!("Output: {}", output_path),
         24.0,
-        68.0,
-        16.0,
+        62.0,
+        15.0,
         LIGHTGRAY,
     );
-    let render_fps = if elapsed > 0.0 {
-        done as f32 / elapsed
-    } else {
-        0.0
-    };
-
-    app.draw_text_with_font(
-        &format!(
-            "Frames: {}/{} ({:.1}%) | {:.1} fps/s | elapsed {:.1}s | ETA {:.1}s",
-            done,
-            total,
-            pct * 100.0,
-            render_fps,
-            elapsed,
-            eta,
-        ),
-        24.0,
-        96.0,
-        16.0,
-        YELLOW,
-    );
+    app.draw_text_with_font(&snapshot.line1, 24.0, 92.0, 16.0, YELLOW);
+    app.draw_text_with_font(&snapshot.line2, 24.0, 118.0, 15.0, LIGHTGRAY);
+    app.draw_text_with_font(&snapshot.line3, 24.0, 142.0, 14.0, GRAY);
 
     let bar_x = 24.0;
-    let bar_y = 124.0;
+    let bar_y = 154.0;
     let bar_w = screen_width() - 48.0;
-    let bar_h = 22.0;
+    let bar_h = 18.0;
     draw_rectangle(bar_x, bar_y, bar_w, bar_h, Color::new(0.18, 0.18, 0.22, 1.0));
     draw_rectangle(
         bar_x,
@@ -1751,14 +1739,20 @@ async fn run_render_export(app: &mut AppState, mut config: RenderExportConfig) -
         ),
     );
 
-    // Create the Win7-style progress dialog before audio mixing so both the
-    // audio mix phase and the frame render phase are visible and cancellable.
+    // Minimize the console instead of hiding/removing it. The visible Macroquad
+    // renderer window itself is used as the progress UI.
+    minimize_console_window();
+
     let taskbar = TaskbarProgress::new();
     let win32_progress = Win32ProgressWindow::new(100, &config.output_path);
+    win32_progress.set_stage("正在准备渲染", "准备音频混合和画面渲染", 0, 100);
+    draw_export_progress_ui(app, &win32_progress, &config.output_path);
     next_frame().await;
-    hide_render_window();
 
     let mixed_audio = make_mixed_audio(&ffmpeg, &chart, &config.bgm_path, duration, &win32_progress, &taskbar)?;
+    win32_progress.set_stage("音频混合完成", "准备开始渲染画面", 100, 100);
+    draw_export_progress_ui(app, &win32_progress, &config.output_path);
+    next_frame().await;
     let mut ffmpeg_child = spawn_ffmpeg_rawvideo(
         &ffmpeg,
         config.fps,
@@ -1778,9 +1772,10 @@ async fn run_render_export(app: &mut AppState, mut config: RenderExportConfig) -
     export_target.texture.set_filter(FilterMode::Nearest);
 
     // Allow macroquad to create its GL context once. Actual video frames are rendered offscreen.
-    // Progress is shown by the Windows Shell IProgressDialog (Win7 file-copy style).
+    // The visible Macroquad window is used for the export progress bar.
     let render_start = Instant::now();
     win32_progress.set(0, frame_count, render_start);
+    draw_export_progress_ui(app, &win32_progress, &config.output_path);
     next_frame().await;
     for frame in 0..frame_count {
         if win32_progress.cancelled() {
@@ -1802,6 +1797,7 @@ async fn run_render_export(app: &mut AppState, mut config: RenderExportConfig) -
         let done = frame + 1;
         taskbar.set(done as u64, frame_count as u64);
         win32_progress.set(done, frame_count, render_start);
+        draw_export_progress_ui(app, &win32_progress, &config.output_path);
 
         if frame == 0 || done == frame_count || done % config.fps.max(1) == 0 {
             let pct = done as f64 * 100.0 / frame_count.max(1) as f64;
@@ -1927,36 +1923,51 @@ async fn main() {
         log::info!("BGM path: {}", app.bgm_path);
     }
 
-    // Load Chinese font
+    // Load Chinese font. Prefer external files during development, then fall
+    // back to the compiled-in Rizline font so the release exe is standalone.
     let font_paths = [
         "rizline.ttf",
-        "ch-rzl/fonts/rizline.ttf",
         "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/simsun.ttc",
     ];
+
+    let mut loaded_font_name: Option<String> = None;
     for path in &font_paths {
         if let Ok(data) = std::fs::read(path) {
             if let Ok(font) = load_ttf_font_from_bytes(&data) {
-                let mut chars = vec![];
-                for c in (32u8..=127u8).map(|x| x as u32) {
-                    chars.push(char::from_u32(c).unwrap());
-                }
-                for c in "谱面线条音符速度还原调试播放停止加载中成功失败请刷新音量信息FPS已加载未加载".chars() {
-                    chars.push(c);
-                }
-                for c in "OK!/:RE:CH-RZL-RUST PLAYER RECORDER v0.1.0 by CHCAT1320CATPLAY".chars() {
-                    chars.push(c);
-                }
-                for size in [13, 14, 16, 20, 24, 30, 36, 48, 60, 90] {
-                    font.populate_font_cache(&chars, size);
-                }
                 app.font = Some(font);
-                log::info!("Loaded font from: {}", path);
+                loaded_font_name = Some(path.to_string());
                 break;
             }
         }
     }
+
     if app.font.is_none() {
+        if let Ok(font) = load_ttf_font_from_bytes(EMBEDDED_RIZLINE_TTF) {
+            app.font = Some(font);
+            loaded_font_name = Some("embedded rizline.ttf".to_string());
+        }
+    }
+
+    if let Some(font) = app.font.as_ref() {
+        let mut chars = vec![];
+        for c in (32u8..=127u8).map(|x| x as u32) {
+            chars.push(char::from_u32(c).unwrap());
+        }
+        for c in "谱面线条音符速度还原调试播放停止加载中成功失败请刷新音量信息FPS已加载未加载".chars() {
+            chars.push(c);
+        }
+        for c in "OK!/:RE:CH-RZL-RUST PLAYER RECORDER v0.1.0 by CHCAT1320CATPLAY".chars() {
+            chars.push(c);
+        }
+        for size in [13, 14, 16, 20, 24, 30, 36, 48, 60, 90] {
+            font.populate_font_cache(&chars, size);
+        }
+        log::info!(
+            "Loaded font from: {}",
+            loaded_font_name.as_deref().unwrap_or("unknown")
+        );
+    } else {
         log::warn!("No custom font loaded");
     }
 
